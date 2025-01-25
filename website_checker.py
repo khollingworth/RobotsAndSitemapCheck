@@ -44,321 +44,194 @@ class WebsiteChecker:
         base_url (str): The base URL of the website to analyze
         robots_parser: Parser for robots.txt rules
         sitemap_urls (List[str]): List of discovered sitemap URLs
+        session (aiohttp.ClientSession): HTTP client session for making requests
     """
 
-    def __init__(self, base_url: str):
-        """Initialize the WebsiteChecker with a base URL.
-
-        Args:
-            base_url (str): The website's base URL to analyze
-        """
-        self.base_url = base_url if base_url.endswith('/') else base_url + '/'
-        self.robots_parser = robotexclusionrulesparser.RobotExclusionRulesParser()
-        self.sitemap_urls: List[str] = []
+    def __init__(self, base_url: str, session: Optional[aiohttp.ClientSession] = None):
+        """Initialize the WebsiteChecker with a base URL and optional session.
         
-    def is_valid_robots_txt(self, content: str) -> bool:
-        """Check if content appears to be a valid robots.txt file.
-
         Args:
-            content (str): The content to check
-
-        Returns:
-            bool: True if content appears to be a valid robots.txt file
+            base_url (str): The base URL of the website to analyze
+            session (Optional[aiohttp.ClientSession]): HTTP client session for making requests
         """
-        content_lower = content.strip().lower()
-        return not content_lower.startswith('<!doctype') and \
-               ('user-agent:' in content_lower or 'disallow:' in content_lower or 'allow:' in content_lower or 'crawl-delay:' in content_lower)
-    
-    def is_valid_sitemap(self, content: str) -> bool:
-        """Check if content appears to be a valid sitemap file.
+        self.base_url = base_url.rstrip('/')
+        self.robots_parser = robotexclusionrulesparser.RobotExclusionRulesParser()
+        self.sitemap_urls = []
+        self.session = session
+        self._own_session = False
 
-        Supports multiple sitemap formats including XML, RSS, and Atom.
+    async def __aenter__(self):
+        """Async context manager entry."""
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+            self._own_session = True
+        return self
 
-        Args:
-            content (str): The content to check
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        if self._own_session and self.session:
+            await self.session.close()
 
+    async def fetch_robots_txt(self) -> Optional[str]:
+        """Fetch and parse the robots.txt file.
+        
         Returns:
-            bool: True if content appears to be a valid sitemap
+            Optional[str]: The contents of robots.txt if found, None otherwise
         """
-        content_lower = content.strip().lower()
-        return not content_lower.startswith('<!doctype html') and \
-               any(marker in content_lower for marker in [
-                   '<urlset', '<sitemapindex', 
-                   '<rss', '<feed',  # RSS and Atom formats
-                   '<news:', '<image:', '<video:'  # Special sitemap extensions
-               ])
-
-    async def fetch_url(self, session: aiohttp.ClientSession, url: str) -> Tuple[str, Optional[str], Optional[datetime]]:
-        """Fetch content from a URL with support for compressed content.
-
-        Args:
-            session (aiohttp.ClientSession): The session to use for the request
-            url (str): The URL to fetch
-
-        Returns:
-            Tuple[str, Optional[str], Optional[datetime]]: URL, content (if successful), and last modified date
-        """
+        robots_url = f"{self.base_url}/robots.txt"
         try:
-            async with session.get(url) as response:
+            async with self.session.get(robots_url) as response:
                 if response.status == 200:
-                    last_modified = response.headers.get('Last-Modified')
-                    last_modified_date = None
-                    if last_modified:
-                        try:
-                            last_modified_date = datetime.strptime(last_modified, '%a, %d %b %Y %H:%M:%S %Z')
-                        except ValueError:
-                            pass
-
-                    # Handle gzipped content
-                    if response.headers.get('Content-Type') == 'application/x-gzip' or url.endswith('.gz'):
-                        compressed_data = await response.read()
-                        try:
-                            with gzip.GzipFile(fileobj=io.BytesIO(compressed_data)) as gz:
-                                content = gz.read().decode('utf-8')
-                        except Exception as e:
-                            print(f"Error decompressing gzipped content from {url}: {str(e)}")
-                            return url, None, None
-                    else:
-                        content = await response.text()
-                    return url, content, last_modified_date
-                return url, None, None
+                    return await response.text()
         except Exception as e:
-            print(f"Error fetching {url}: {str(e)}")
-            return url, None, None
+            print(f"Error fetching robots.txt: {e}")
+        return None
 
-    def parse_sitemap(self, content: str) -> List[str]:
-        """Parse a sitemap file and extract all URLs.
-
-        Supports multiple sitemap formats and provides fallback parsing methods.
-
-        Args:
-            content (str): The sitemap content to parse
-
-        Returns:
-            List[str]: List of URLs found in the sitemap
-        """
-        if not self.is_valid_sitemap(content):
-            print("Warning: Content doesn't appear to be a valid sitemap")
-            return []
-            
-        urls = []
-        try:
-            # Try parsing with BeautifulSoup first
-            soup = BeautifulSoup(content, 'xml')
-            
-            # Handle regular sitemaps
-            for url in soup.find_all('loc'):
-                urls.append(url.text.strip())
-                
-            # Handle RSS feeds
-            for item in soup.find_all('item'):
-                link = item.find('link')
-                if link and link.string:
-                    urls.append(link.string.strip())
-
-            # Handle Atom feeds
-            for entry in soup.find_all('entry'):
-                link = entry.find('link', href=True)
-                if link:
-                    urls.append(link['href'].strip())
-
-            # Handle special sitemap extensions
-            for special_url in soup.find_all(['image:loc', 'video:content_loc', 'news:loc']):
-                urls.append(special_url.text.strip())
-
-        except Exception as e:
-            print(f"BeautifulSoup parsing failed, trying ElementTree: {str(e)}")
-            try:
-                # Fallback to ElementTree for simpler XML parsing
-                root = ET.fromstring(content)
-                # Extract URLs from any element with 'loc' in the tag name
-                for elem in root.iter():
-                    if 'loc' in elem.tag.lower():
-                        urls.append(elem.text.strip())
-            except Exception as e:
-                print(f"Error parsing sitemap with ElementTree: {str(e)}")
-                return []
-                
-        return list(dict.fromkeys(urls))  # Remove duplicates while preserving order
-
-    def extract_sitemap_from_robots(self, content: str) -> List[str]:
-        """Extract sitemap URLs from robots.txt content.
-
-        Args:
-            content (str): The robots.txt content
-
+    async def find_sitemaps_in_robots(self) -> List[str]:
+        """Find sitemap URLs listed in robots.txt.
+        
         Returns:
             List[str]: List of sitemap URLs found in robots.txt
         """
-        sitemaps = []
-        for line in content.splitlines():
-            if line.lower().startswith('sitemap:'):
-                sitemap_url = line.split(':', 1)[1].strip()
-                sitemaps.append(sitemap_url)
-        return sitemaps
+        robots_content = await self.fetch_robots_txt()
+        if robots_content:
+            self.robots_parser.parse(robots_content)
+            return self.robots_parser.sitemaps
+        return []
+
+    async def fetch_sitemap(self, url: str) -> Optional[str]:
+        """Fetch a sitemap from the given URL.
+        
+        Args:
+            url (str): The URL of the sitemap to fetch
+            
+        Returns:
+            Optional[str]: The contents of the sitemap if found, None otherwise
+        """
+        try:
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    if url.endswith('.gz'):
+                        return self.decompress_gzip(content)
+                    return content.decode('utf-8')
+        except Exception as e:
+            print(f"Error fetching sitemap {url}: {e}")
+        return None
+
+    def decompress_gzip(self, content: bytes) -> str:
+        """Decompress gzipped content.
+        
+        Args:
+            content (bytes): The gzipped content to decompress
+            
+        Returns:
+            str: The decompressed content as a string
+        """
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
+                return gz.read().decode('utf-8')
+        except Exception as e:
+            print(f"Error decompressing content: {e}")
+            return ""
+
+    def parse_sitemap_urls(self, content: str) -> List[str]:
+        """Parse URLs from a sitemap.
+        
+        Args:
+            content (str): The sitemap content to parse
+            
+        Returns:
+            List[str]: List of URLs found in the sitemap
+        """
+        urls = []
+        try:
+            soup = BeautifulSoup(content, 'xml')
+            # Check for sitemap index
+            for sitemap in soup.find_all('sitemap'):
+                loc = sitemap.find('loc')
+                if loc:
+                    urls.append(loc.text)
+            
+            # Check for regular URLs
+            for url in soup.find_all('url'):
+                loc = url.find('loc')
+                if loc:
+                    urls.append(loc.text)
+        except Exception as e:
+            print(f"Error parsing sitemap: {e}")
+        return urls
 
     def is_url_allowed(self, url: str) -> bool:
-        """Check if a URL is allowed to be crawled according to robots.txt rules.
-
+        """Check if a URL is allowed by robots.txt rules.
+        
         Args:
             url (str): The URL to check
-
+            
         Returns:
-            bool: True if the URL is allowed to be crawled
+            bool: True if the URL is allowed, False otherwise
         """
         return self.robots_parser.is_allowed("*", url)
 
-    async def process_sitemap(self, session: aiohttp.ClientSession, content: str, url: str, depth: int = 0):
-        """Process a sitemap file and its sub-sitemaps recursively.
-
-        Args:
-            session (aiohttp.ClientSession): The session to use for requests
-            content (str): The sitemap content to process
-            url (str): The URL of the sitemap
-            depth (int, optional): Current recursion depth. Defaults to 0.
-        """
-        if depth > 5:  # Prevent infinite recursion
-            print(f"Warning: Maximum sitemap depth reached at {url}")
-            return
-
-        print(f"\nAnalyzing{'  ' * depth}sitemap: {url}")
-        urls = self.parse_sitemap(content)
-        
-        if not urls:
-            print("No URLs found in sitemap")
-            return
-            
-        # Separate sitemap URLs from content URLs
-        sitemap_urls = []
-        content_urls = []
-        
-        for url in urls:
-            if any(url.endswith(ext) for ext in ['.xml', '.xml.gz']) or 'sitemap' in url.lower():
-                sitemap_urls.append(url)
-            else:
-                content_urls.append(url)
-        
-        # Process sub-sitemaps first
-        if sitemap_urls:
-            print(f"\nFound{' ' * depth}{len(sitemap_urls)} sub-sitemaps:")
-            for sitemap_url in sitemap_urls:
-                print(f"🗺️  {sitemap_url}")
-                url, sub_content, date = await self.fetch_url(session, sitemap_url)
-                if sub_content and self.is_valid_sitemap(sub_content):
-                    await self.process_sitemap(session, sub_content, url, depth + 1)
-        
-        # Process content URLs
-        if content_urls:
-            crawlable_urls = []
-            uncrawlable_urls = []
-            
-            for url in content_urls:
-                if self.is_url_allowed(url):
-                    crawlable_urls.append(url)
-                else:
-                    uncrawlable_urls.append(url)
-            
-            if crawlable_urls:
-                print(f"\nFound{' ' * depth}{len(crawlable_urls)} unique crawlable content URLs:")
-                for url in crawlable_urls:
-                    print(f"✅ {url}")
-            
-            if uncrawlable_urls:
-                print(f"\nFound{' ' * depth}{len(uncrawlable_urls)} URLs blocked by robots.txt:")
-                for url in uncrawlable_urls:
-                    print(f"❌ {url}")
-
-    async def check_website(self):
-        """Main method to check a website's robots.txt and sitemaps.
-
-        This method:
-        1. Checks for robots.txt
-        2. Extracts sitemaps from robots.txt
-        3. Checks common sitemap locations
-        4. Processes all found sitemaps
-        """
-        robots_url = urljoin(self.base_url, 'robots.txt')
-        common_sitemap_paths = [
-            'sitemap.xml',
-            'sitemap_index.xml',
-            'sitemap-index.xml',
-            'sitemap/sitemap.xml',
-            'sitemapindex.xml',
-            'sitemap.xml.gz',  # Common compressed formats
-            'sitemap_index.xml.gz',
-            'sitemap-index.xml.gz',
-            'news-sitemap.xml',  # Special sitemaps
-            'video-sitemap.xml',
-            'image-sitemap.xml'
-        ]
-        
-        async with aiohttp.ClientSession() as session:
-            # First check robots.txt
-            robots_url, robots_content, robots_date = await self.fetch_url(session, robots_url)
-            
-            sitemap_from_robots = []
-            if robots_content:
-                if not self.is_valid_robots_txt(robots_content):
-                    print(f"❌ Invalid robots.txt found at {robots_url} (appears to be HTML or other content)")
-                else:
-                    print(f"✅ robots.txt exists at {robots_url}")
-                    if robots_date:
-                        print(f"   Last modified: {robots_date}")
-                    else:
-                        print("   Last modified date not available")
-                    self.robots_parser.parse(robots_content)
-                    
-                    print("\nRobots.txt rules:")
-                    print(robots_content.strip())
-                    
-                    # Extract sitemap URLs from robots.txt
-                    sitemap_from_robots = self.extract_sitemap_from_robots(robots_content)
-                    if sitemap_from_robots:
-                        print("\nSitemaps found in robots.txt:")
-                        for sitemap in sitemap_from_robots:
-                            print(f"🔍 {sitemap}")
-            else:
-                print(f"❌ robots.txt not found at {robots_url}")
-            
-            # Try sitemaps from robots.txt first
-            sitemap_found = False
-            if sitemap_from_robots:
-                for sitemap_url in sitemap_from_robots:
-                    url, content, date = await self.fetch_url(session, sitemap_url)
-                    if content and self.is_valid_sitemap(content):
-                        sitemap_found = True
-                        print(f"\n✅ Valid sitemap found at {url}")
-                        if date:
-                            print(f"   Last modified: {date}")
-                        await self.process_sitemap(session, content, url)
-                        break
-            
-            # If no sitemap found in robots.txt, try common locations
-            if not sitemap_found:
-                print("\nChecking common sitemap locations...")
-                for path in common_sitemap_paths:
-                    sitemap_url = urljoin(self.base_url, path)
-                    url, content, date = await self.fetch_url(session, sitemap_url)
-                    if content and self.is_valid_sitemap(content):
-                        sitemap_found = True
-                        print(f"✅ Valid sitemap found at {url}")
-                        if date:
-                            print(f"   Last modified: {date}")
-                        await self.process_sitemap(session, content, url)
-                        break
-                
-                if not sitemap_found:
-                    print("❌ No valid sitemap found in any common location")
-
-def main():
-    """Entry point of the script."""
+async def main():
+    """Main entry point of the script."""
     if len(sys.argv) != 2:
         print("Usage: python website_checker.py <website_url>")
         sys.exit(1)
 
     website_url = sys.argv[1]
-    checker = WebsiteChecker(website_url)
-    asyncio.run(checker.check_website())
+    async with aiohttp.ClientSession() as session:
+        async with WebsiteChecker(website_url, session) as checker:
+            # Fetch and parse robots.txt
+            robots_txt = await checker.fetch_robots_txt()
+            if robots_txt:
+                print(f"✅ robots.txt exists at {website_url}/robots.txt")
+                print("   Last modified:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                print("\nRobots.txt rules:")
+                print(robots_txt)
+            else:
+                print(f"❌ No robots.txt found at {website_url}/robots.txt")
+
+            # Find sitemaps in robots.txt
+            print("\nChecking common sitemap locations...")
+            sitemaps = await checker.find_sitemaps_in_robots()
+            
+            if not sitemaps:
+                common_locations = [
+                    '/sitemap.xml',
+                    '/sitemap_index.xml',
+                    '/wp-sitemap.xml',
+                    '/sitemap.php',
+                ]
+                for loc in common_locations:
+                    sitemap_url = website_url + loc
+                    content = await checker.fetch_sitemap(sitemap_url)
+                    if content:
+                        print(f"✅ Valid sitemap found at {sitemap_url}")
+                        sitemaps.append(sitemap_url)
+                        break
+
+            # Process each sitemap
+            for sitemap_url in sitemaps:
+                print(f"\nAnalyzingsitemap: {sitemap_url}")
+                content = await checker.fetch_sitemap(sitemap_url)
+                if content:
+                    urls = checker.parse_sitemap_urls(content)
+                    if any(url.endswith('.xml') for url in urls):
+                        print(f"\nFound{len(urls)} sub-sitemaps:")
+                        for url in urls:
+                            if url.endswith('.xml'):
+                                print(f"🗺️  {url}")
+                                print("\nAnalyzing  sitemap:", url)
+                                sub_content = await checker.fetch_sitemap(url)
+                                if sub_content:
+                                    sub_urls = checker.parse_sitemap_urls(sub_content)
+                                    print(f"\nFound {len(sub_urls)} unique crawlable content URLs:")
+                                    for sub_url in sub_urls:
+                                        if checker.is_url_allowed(sub_url):
+                                            print(f"✅ {sub_url}")
+                                        else:
+                                            print(f"❌ {sub_url} (blocked by robots.txt)")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

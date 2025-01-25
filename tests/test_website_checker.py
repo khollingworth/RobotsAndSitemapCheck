@@ -3,12 +3,12 @@ import aiohttp
 import gzip
 from bs4 import BeautifulSoup
 from website_checker import WebsiteChecker
+import pytest_asyncio
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def google_checker():
     async with aiohttp.ClientSession() as session:
-        checker = WebsiteChecker("https://google.com", session)
-        yield checker
+        yield WebsiteChecker("https://google.com", session)
 
 @pytest.mark.asyncio
 async def test_google_robots_txt(google_checker):
@@ -63,13 +63,18 @@ async def test_compressed_sitemap_handling(google_checker):
 @pytest.mark.asyncio
 async def test_url_allowed_by_robots(google_checker):
     """Test URL permission checking against robots.txt"""
+    # First fetch and parse robots.txt
+    robots_txt = await google_checker.fetch_robots_txt()
+    assert robots_txt is not None
+    google_checker.robots_parser.parse(robots_txt)
+    
     # These URLs should be allowed
-    assert await google_checker.is_url_allowed("https://www.google.com/about")
-    assert await google_checker.is_url_allowed("https://www.google.com/")
+    assert google_checker.is_url_allowed("https://www.google.com/about")
+    assert google_checker.is_url_allowed("https://www.google.com/")
     
     # These URLs should be blocked
-    assert not await google_checker.is_url_allowed("https://www.google.com/search?q=test")
-    assert not await google_checker.is_url_allowed("https://www.google.com/sdch")
+    assert not google_checker.is_url_allowed("https://www.google.com/search?q=test")
+    assert not google_checker.is_url_allowed("https://www.google.com/sdch")
 
 @pytest.mark.asyncio
 async def test_sitemap_index_handling(google_checker):
